@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import quad
 from scipy.linalg import solve
 
 # ------------------------------------------------------------
@@ -13,7 +12,7 @@ alpha, beta = 0.01, 4.0
 N = 99   # 99 intervals → 100 points
 
 def build_grid(a):
-    """Exponential clustering with stable formula to avoid overflow."""
+    """Exponential clustering with stable formula."""
     if a == 0:
         return np.linspace(alpha, beta, N+1)
     q = np.exp(-a / N)
@@ -22,35 +21,75 @@ def build_grid(a):
     return alpha + (beta - alpha) * (1.0 - q**(N - k)) / (1.0 - qN)
 
 # ------------------------------------------------------------
-# FEM (Ritz) solver – piecewise linear
+# Exact analytical integrals for the specific example
+# ------------------------------------------------------------
+def poly_integral(coef, a, b):
+    """Integrate polynomial ∑ coef[i] * x^i from a to b."""
+    # coef: [c0, c1, c2, ...] for c0 + c1*x + c2*x^2 + ...
+    def integ(x):
+        return np.polyval(coef[::-1], x)   # np.polyval expects descending powers
+    # Use numpy's polyint to get antiderivative
+    antideriv = np.polyint(coef[::-1])     # returns descending coefficients
+    return np.polyval(antideriv, b) - np.polyval(antideriv, a)
+
+def compute_fem_integrals(xj, xjp1):
+    """Compute p, q00, q01, q11, v0, v1 for the element [xj, xjp1]."""
+    hj = xjp1 - xj
+    # p = ∫ x dx = (xjp1^2 - xj^2)/2
+    p = 0.5 * (xjp1**2 - xj**2)
+    
+    # q^{st} = 2 * ∫ x^2 * (x - x_{j+s})(x - x_{j+t}) dx
+    # We'll compute the integrand as a polynomial.
+    # For given s,t (0 for xj, 1 for xjp1):
+    # (x - xj)*(x - xj) = (x - xj)^2 = x^2 - 2xj x + xj^2
+    # (x - xjp1)^2 similarly, and (x - xj)*(x - xjp1) = x^2 - (xj+xjp1)x + xj*xjp1
+    # Then multiply by 2 x^2 and integrate.
+    def q_integral(s, t):
+        xs = xj if s==0 else xjp1
+        xt = xj if t==0 else xjp1
+        # polynomial for (x - xs)*(x - xt) = x^2 - (xs+xt)x + xs*xt
+        # coefficients in ascending order: [xs*xt, -(xs+xt), 1]
+        poly = [xs*xt, -(xs+xt), 1.0]
+        # multiply by 2 x^2 => 2 * x^2 * poly = [2*xs*xt, -2*(xs+xt), 2, 0, 0] in ascending? Actually:
+        # 2 x^2 * (c0 + c1 x + c2 x^2) = 2 c0 x^2 + 2 c1 x^3 + 2 c2 x^4
+        # coefficients ascending: [0, 0, 2*c0, 2*c1, 2*c2]
+        coef = [0.0, 0.0, 2.0*poly[0], 2.0*poly[1], 2.0*poly[2]]
+        return poly_integral(coef, xj, xjp1)
+    
+    q00 = q_integral(0,0)
+    q11 = q_integral(1,1)
+    q01 = q_integral(0,1)
+    
+    # v^s = hj * ∫ x^2 * (x - x_{j+s}) dx = hj * ∫ (x^3 - xs x^2) dx
+    def v_integral(s):
+        xs = xj if s==0 else xjp1
+        # integrand: x^3 - xs x^2 => coefficients ascending: [0, 0, -xs, 1]
+        coef = [0.0, 0.0, -xs, 1.0]
+        return hj * poly_integral(coef, xj, xjp1)
+    
+    v0 = v_integral(0)
+    v1 = v_integral(1)
+    
+    return p, q00, q01, q11, v0, v1
+
+# ------------------------------------------------------------
+# FEM (Ritz) solver – piecewise linear, exact integrals
 # ------------------------------------------------------------
 def solve_fem(x):
     n = len(x)
-    h = x[1:] - x[:-1]
     A = np.zeros((n, n))
     b = np.zeros(n)
     for j in range(n-1):
         xj, xjp1 = x[j], x[j+1]
-        hj = h[j]
-        # p_j = ∫ x dx
-        pj = 0.5 * (xjp1**2 - xj**2)
-        # q^{00}, q^{11}, q^{01} = ∫ x * (c3/c1) * (x - x_{j+s})(x - x_{j+t}) dx
-        # c3/c1 = 2x, so integrand = 2 x^2 * (...)
-        q00, _ = quad(lambda xv: 2.0*xv**2*(xv-xj)**2, xj, xjp1)
-        q11, _ = quad(lambda xv: 2.0*xv**2*(xv-xjp1)**2, xj, xjp1)
-        q01, _ = quad(lambda xv: 2.0*xv**2*(xv-xj)*(xv-xjp1), xj, xjp1)
-        # v^0, v^1 = hj * ∫ x * (c4/c1) * (x - x_{j+s}) dx
-        # c4/c1 = x, so integrand = x^2 * (...)
-        v0 = hj * quad(lambda xv: xv*(xv-xj), xj, xjp1)[0]
-        v1 = hj * quad(lambda xv: xv*(xv-xjp1), xj, xjp1)[0]
-        # local stiffness matrix
-        A[j, j]     += pj - q11
-        A[j, j+1]   += -pj + q01
-        A[j+1, j]   += -pj + q01
-        A[j+1, j+1] += pj - q00
+        p, q00, q01, q11, v0, v1 = compute_fem_integrals(xj, xjp1)
+        # Local matrix from paper (loyalist1)
+        A[j, j]     += p - q11
+        A[j, j+1]   += -p + q01
+        A[j+1, j]   += -p + q01
+        A[j+1, j+1] += p - q00
         b[j]     += v1
         b[j+1]   += -v0
-    # apply BCs
+    # Apply BCs
     A0 = A[1:-1, 1:-1]
     b0 = b[1:-1] - A[1:-1, 0]*2.0 - A[1:-1, -1]*5.0
     y = np.zeros(n)
@@ -60,11 +99,12 @@ def solve_fem(x):
     return y
 
 # ------------------------------------------------------------
-# DNBM solver – global distance-network basis
+# DNBM solver (unchanged, but uses quad – can also be exact)
 # ------------------------------------------------------------
+from scipy.integrate import quad
+
 def solve_dnbm(x):
     n = len(x)
-    # D_rho matrix: (xi - xj)^4
     D = np.array([[(xi - xj)**4 for xj in x] for xi in x])
     D_inv = np.linalg.inv(D)
     def alpha(i, xv):
@@ -72,7 +112,7 @@ def solve_dnbm(x):
     def beta(i, xv):
         return np.sum(D_inv[i] * 4.0 * (xv - x)**3)
     
-    m = n - 2   # number of interior nodes
+    m = n - 2
     R = np.zeros((m, m))
     Q = np.zeros(m)
     for i in range(1, n-1):
@@ -87,7 +127,6 @@ def solve_dnbm(x):
             lambda xv: -xv * xv * alpha(i, xv),
             alpha, beta, epsabs=1e-12
         )
-        # boundary contributions
         for bnd, val in [(0,2.0), (n-1,5.0)]:
             gam, _ = quad(
                 lambda xv: xv * (beta(i, xv)*beta(bnd, xv) - 2.0*xv**2*alpha(i, xv)*alpha(bnd, xv)),
