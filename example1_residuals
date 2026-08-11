@@ -1,0 +1,165 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import quad
+from scipy.linalg import solve
+
+# ------------------------------------------------------------
+# Parameters for Example 1
+# ODE:  x y'' + y' + 2 x^2 y = x^2
+# BC:   y(0.01)=2, y(4)=5
+# Grid: 100 points with mild clustering a=820
+# ------------------------------------------------------------
+alpha, beta = 0.01, 4.0
+N = 99   # 99 intervals → 100 points
+
+def build_grid(a):
+    """Exponential clustering with stable formula to avoid overflow."""
+    if a == 0:
+        return np.linspace(alpha, beta, N+1)
+    q = np.exp(-a / N)
+    qN = q**N
+    k = np.arange(N+1)
+    return alpha + (beta - alpha) * (1.0 - q**(N - k)) / (1.0 - qN)
+
+# ------------------------------------------------------------
+# FEM (Ritz) solver – piecewise linear
+# ------------------------------------------------------------
+def solve_fem(x):
+    n = len(x)
+    h = x[1:] - x[:-1]
+    A = np.zeros((n, n))
+    b = np.zeros(n)
+    for j in range(n-1):
+        xj, xjp1 = x[j], x[j+1]
+        hj = h[j]
+        # p_j = ∫ x dx
+        pj = 0.5 * (xjp1**2 - xj**2)
+        # q^{00}, q^{11}, q^{01} = ∫ x * (c3/c1) * (x - x_{j+s})(x - x_{j+t}) dx
+        # c3/c1 = 2x, so integrand = 2 x^2 * (...)
+        q00, _ = quad(lambda xv: 2.0*xv**2*(xv-xj)**2, xj, xjp1)
+        q11, _ = quad(lambda xv: 2.0*xv**2*(xv-xjp1)**2, xj, xjp1)
+        q01, _ = quad(lambda xv: 2.0*xv**2*(xv-xj)*(xv-xjp1), xj, xjp1)
+        # v^0, v^1 = hj * ∫ x * (c4/c1) * (x - x_{j+s}) dx
+        # c4/c1 = x, so integrand = x^2 * (...)
+        v0 = hj * quad(lambda xv: xv*(xv-xj), xj, xjp1)[0]
+        v1 = hj * quad(lambda xv: xv*(xv-xjp1), xj, xjp1)[0]
+        # local stiffness matrix
+        A[j, j]     += pj - q11
+        A[j, j+1]   += -pj + q01
+        A[j+1, j]   += -pj + q01
+        A[j+1, j+1] += pj - q00
+        b[j]     += v1
+        b[j+1]   += -v0
+    # apply BCs
+    A0 = A[1:-1, 1:-1]
+    b0 = b[1:-1] - A[1:-1, 0]*2.0 - A[1:-1, -1]*5.0
+    y = np.zeros(n)
+    y[0] = 2.0
+    y[-1] = 5.0
+    y[1:-1] = solve(A0, b0)
+    return y
+
+# ------------------------------------------------------------
+# DNBM solver – global distance-network basis
+# ------------------------------------------------------------
+def solve_dnbm(x):
+    n = len(x)
+    # D_rho matrix: (xi - xj)^4
+    D = np.array([[(xi - xj)**4 for xj in x] for xi in x])
+    D_inv = np.linalg.inv(D)
+    def alpha(i, xv):
+        return np.sum(D_inv[i] * (xv - x)**4)
+    def beta(i, xv):
+        return np.sum(D_inv[i] * 4.0 * (xv - x)**3)
+    
+    m = n - 2   # number of interior nodes
+    R = np.zeros((m, m))
+    Q = np.zeros(m)
+    for i in range(1, n-1):
+        ii = i-1
+        for j in range(1, n-1):
+            jj = j-1
+            R[ii, jj], _ = quad(
+                lambda xv: xv * (beta(i, xv)*beta(j, xv) - 2.0*xv**2*alpha(i, xv)*alpha(j, xv)),
+                alpha, beta, epsabs=1e-12
+            )
+        Q[ii], _ = quad(
+            lambda xv: -xv * xv * alpha(i, xv),
+            alpha, beta, epsabs=1e-12
+        )
+        # boundary contributions
+        for bnd, val in [(0,2.0), (n-1,5.0)]:
+            gam, _ = quad(
+                lambda xv: xv * (beta(i, xv)*beta(bnd, xv) - 2.0*xv**2*alpha(i, xv)*alpha(bnd, xv)),
+                alpha, beta, epsabs=1e-12
+            )
+            Q[ii] -= gam * val
+    y = np.zeros(n)
+    y[0] = 2.0
+    y[-1] = 5.0
+    y[1:-1] = solve(R, Q)
+    return y
+
+# ------------------------------------------------------------
+# Residual evaluators
+# ------------------------------------------------------------
+def residual_fem(x, y):
+    n = len(x)
+    h = x[1:] - x[:-1]
+    R = np.zeros(n)
+    for k in range(n-1):
+        slope = (y[k+1] - y[k]) / h[k]
+        R[k] = slope + 2.0*x[k]**2*y[k] - x[k]**2
+    slope = (y[-1] - y[-2]) / h[-1]
+    R[-1] = slope + 2.0*x[-1]**2*y[-1] - x[-1]**2
+    return R
+
+def residual_dnbm(x, y):
+    n = len(x)
+    D = np.array([[(xi - xj)**4 for xj in x] for xi in x])
+    D_inv = np.linalg.inv(D)
+    R = np.zeros(n)
+    for k, xv in enumerate(x):
+        alpha_vec = np.sum(D_inv * (xv - x)**4, axis=1)
+        beta_vec  = np.sum(D_inv * 4.0*(xv - x)**3, axis=1)
+        gamma_vec = np.sum(D_inv * 12.0*(xv - x)**2, axis=1)
+        yv  = np.dot(y, alpha_vec)
+        yp  = np.dot(y, beta_vec)
+        ypp = np.dot(y, gamma_vec)
+        R[k] = xv*ypp + yp + 2.0*xv**2*yv - xv**2
+    return R
+
+# ------------------------------------------------------------
+# Generate grid and solve
+# ------------------------------------------------------------
+a = 820   # mild clustering
+x = build_grid(a)
+
+y_fem   = solve_fem(x)
+y_dnbm  = solve_dnbm(x)
+
+R_fem   = residual_fem(x, y_fem)
+R_dnbm  = residual_dnbm(x, y_dnbm)
+
+max_fem  = np.max(np.abs(R_fem))
+max_dnbm = np.max(np.abs(R_dnbm))
+loc_fem  = x[np.argmax(np.abs(R_fem))]
+loc_dnbm = x[np.argmax(np.abs(R_dnbm))]
+
+print(f"FEM  max |R| = {max_fem:.4e}  at x = {loc_fem:.6f}")
+print(f"DNBM max |R| = {max_dnbm:.4e}  at x = {loc_dnbm:.6f}")
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+plt.figure(figsize=(9,5))
+plt.plot(x, R_fem, 'b-o', markersize=3, linewidth=1.5, label='Ritz FEM')
+plt.plot(x, R_dnbm, 'r-s', markersize=3, linewidth=1.5, label='DNBM')
+plt.xlabel('$x$', fontsize=13)
+plt.ylabel('Residual $R(x)$', fontsize=13)
+plt.title('Residuals on a 100‑point grid (mild clustering, $a=820$)', fontsize=14)
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('residual_plot_a820.pdf', dpi=300)
+plt.show()
